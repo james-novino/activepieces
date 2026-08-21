@@ -66,6 +66,7 @@ export const executeAgentRunJob: JobHandler<ExecuteAgentRunJobData, FireAndForge
         // The collector outlives the turn so a throw from inside it cannot discard usage already recorded.
         const usageCollector = createAgentUsageCollector()
         let turnCompleted = false
+        let autoTitlePromise: Promise<string | undefined> | undefined
         const structured: { output?: Record<string, unknown> } = {}
 
         let progressSequence = 0
@@ -205,7 +206,7 @@ export const executeAgentRunJob: JobHandler<ExecuteAgentRunJobData, FireAndForge
 
             const thinkingStartTime = Date.now()
 
-            const autoTitlePromise = generateTitleIfFirstTurn({
+            autoTitlePromise = generateTitleIfFirstTurn({
                 model, provider, userMessage, previousUiMessages: config.previousUiMessages as unknown[], log, conversationId, abortSignal: abortController.signal, usageCollector,
             })
 
@@ -295,6 +296,7 @@ export const executeAgentRunJob: JobHandler<ExecuteAgentRunJobData, FireAndForge
                         log.error({ error: retryError, conversation: { id: conversationId } }, 'Cancel save retry also failed')
                     }
                 }
+                await autoTitlePromise?.catch(() => undefined)
                 const stoppedResult = stepResultFrom({ prompt: userMessage, uiParts: [], timestamp: new Date().toISOString(), tools: configuredPieceTools, structuredOutput: structured.output, failure: 'The agent run was stopped before it finished', ...spreadIfDefined('usage', usageCollector.snapshot()) })
                 reportFinal(stoppedResult)
                 await releaseFlowStep({ ctx, conversationId, flowRunId, waitpointId, output: stoppedResult, source, log })
@@ -372,6 +374,8 @@ export const executeAgentRunJob: JobHandler<ExecuteAgentRunJobData, FireAndForge
             const clientMessage = !isCreditError && isTransientFailureText(errorMessage)
                 ? 'The AI provider is temporarily unavailable. Please try again in a moment.'
                 : attributed
+            // Settle the concurrent title generation so a billed title call lands in the snapshot.
+            await autoTitlePromise?.catch(() => undefined)
             if (!turnCompleted) {
                 usageCollector.markIncomplete()
             }

@@ -1,4 +1,5 @@
 import { AgentRunSource, WorkerJobType } from '@activepieces/shared'
+import { generateText } from 'ai'
 import { describe, expect, it, vi } from 'vitest'
 import { UNATTENDED_WEB_TOOLS } from '../../../../../../src/lib/execute/jobs/ee/agent/agent-tool-policy'
 import { stepResultFrom } from '../../../../../../src/lib/execute/jobs/ee/agent/agent-step-result'
@@ -8,6 +9,11 @@ import { decideLoopAction, runAgentTurn, shouldRetryStream } from '../../../../.
 vi.mock('../../../../../../src/lib/execute/jobs/ee/agent/run-agent-turn', async (importOriginal) => {
     const actual = await importOriginal<typeof import('../../../../../../src/lib/execute/jobs/ee/agent/run-agent-turn')>()
     return { ...actual, runAgentTurn: vi.fn() }
+})
+
+vi.mock('ai', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('ai')>()
+    return { ...actual, generateText: vi.fn() }
 })
 
 vi.mock('@activepieces/server-utils', async (importOriginal) => {
@@ -216,7 +222,7 @@ describe('executeAgentRunJob — a stream error must not drop the billed usage',
         incomplete: true,
     }
 
-    const makeCtx = () => {
+    const makeCtx = ({ previousUiMessages }: { previousUiMessages?: unknown[] } = {}) => {
         const log: Record<string, ReturnType<typeof vi.fn>> = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
         log.child = vi.fn(() => log)
         const apiClient = {
@@ -229,7 +235,7 @@ describe('executeAgentRunJob — a stream error must not drop the billed usage',
                 systemPrompt: 'system',
                 messages: [],
                 allMessages: [],
-                previousUiMessages: [],
+                previousUiMessages: previousUiMessages ?? [],
                 tier: { id: 'standard', thinkingBudget: 0, modelId: 'claude-sonnet-4-5-20250929' },
                 mcpCredentials: null,
                 projects: [],
@@ -297,6 +303,53 @@ describe('executeAgentRunJob — a stream error must not drop the billed usage',
         const { output } = apiClient.resumeFlowStep.mock.calls[0][0] as { output: { status: string, usage?: unknown } }
         expect(output.status).toBe('FAILED')
         expect(output.usage).toEqual(expectedUsage)
+    })
+
+    it('waits for an in-flight title generation so its billed call lands in the failed step output', async () => {
+        vi.mocked(generateText).mockImplementation((() => new Promise((resolve) => {
+            setTimeout(() => resolve({
+                text: 'Fix the invoice flow',
+                response: { modelId: 'title-model-2026' },
+                usage: { inputTokens: 7, outputTokens: 3 },
+            }), 30)
+        })) as never)
+        vi.mocked(runAgentTurn).mockImplementation(async (params) => {
+            params.usageCollector.record({
+                provider: 'anthropic',
+                model: 'claude-sonnet-4-5-20250929',
+                usage: { inputTokens: 100, outputTokens: 20 },
+            })
+            params.usageCollector.markIncomplete()
+            return {
+                accumulatedResponseMessages: [],
+                uiParts: [],
+                usage: undefined,
+                finishReason: 'error',
+                truncatedAfterRetries: false,
+                budgetExceeded: false,
+                streamError: new Error('the provider dropped the stream'),
+                continuations: 0,
+                totalInputTokens: 100,
+                totalOutputTokens: 20,
+                toolCalls: [],
+            }
+        })
+        const { ctx, apiClient } = makeCtx({ previousUiMessages: [{}] })
+
+        await expect(executeAgentRunJob.execute(ctx, jobData)).rejects.toThrow('the provider dropped the stream')
+
+        expect(apiClient.resumeFlowStep).toHaveBeenCalledTimes(1)
+        const { output } = apiClient.resumeFlowStep.mock.calls[0][0] as { output: { status: string, usage?: unknown } }
+        expect(output.status).toBe('FAILED')
+        expect(output.usage).toEqual({
+            version: 1,
+            calls: [
+                { provider: 'anthropic', model: 'claude-sonnet-4-5-20250929', inputTokens: 100, outputTokens: 20 },
+                { provider: 'anthropic', model: 'title-model-2026', inputTokens: 7, outputTokens: 3 },
+            ],
+            totals: { inputTokens: 107, outputTokens: 23 },
+            incomplete: true,
+        })
     })
 
     it('keeps usage recorded before runAgentTurn threw, flagged incomplete (the collector outlives the turn)', async () => {
